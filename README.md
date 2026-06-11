@@ -20,13 +20,37 @@ Smriti stores durable memories as plain markdown files with YAML frontmatter. Th
 
 ## Installation
 
-### From PyPI
+Smriti MCP is published on PyPI as [`smriti-mcp`](https://pypi.org/project/smriti-mcp/).
+
+### With pip
+
+Install into your current Python environment:
 
 ```bash
 pip install smriti-mcp
 ```
 
-### From source
+Then verify the CLI is available:
+
+```bash
+smriti-mcp --help
+```
+
+### With uv
+
+Install Smriti as a persistent command-line tool:
+
+```bash
+uv tool install smriti-mcp
+```
+
+Or run it directly without a separate install:
+
+```bash
+uvx smriti-mcp --help
+```
+
+### From source for development
 
 ```bash
 git clone https://github.com/deepak-bhardwaj-ps/smriti-mcp.git
@@ -49,9 +73,15 @@ export SMRITI_MEMORY_ROOT="$HOME/.smriti/memory"
 smriti-mcp server
 ```
 
+If you prefer `uvx`, run the server with:
+
+```bash
+uvx smriti-mcp server --memory-root ~/.smriti/memory
+```
+
 ### 2. Configure in your MCP client
 
-**Claude Desktop** (`~/.config/claude_desktop_config.json`):
+**Claude Desktop with pip or `uv tool install`** (`~/.config/claude_desktop_config.json`):
 
 ```json
 {
@@ -60,6 +90,20 @@ smriti-mcp server
       "type": "stdio",
       "command": "smriti-mcp",
       "args": ["server", "--memory-root", "~/.smriti/memory"]
+    }
+  }
+}
+```
+
+**Claude Desktop with `uvx`**:
+
+```json
+{
+  "mcpServers": {
+    "smriti": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["smriti-mcp", "server", "--memory-root", "~/.smriti/memory"]
     }
   }
 }
@@ -78,6 +122,8 @@ Then restart Claude Desktop and Smriti will be available as a tool.
 | `append_memory` | Add content to the end of an existing memory |
 | `update_memory` | Patch metadata or replace memory content |
 | `delete_memory` | Permanently remove a memory |
+| `remember` | Agent-friendly write API that records a trace and can create, append, or update |
+| `consolidate_memory` | Create, append, or update a memory from reviewed trace content |
 
 ### Search & Browse
 
@@ -139,6 +185,7 @@ See also: [[Async Migration]], [[Performance Metrics]]
 - **short_description**: Brief summary (used in indexes)
 - **created_at**: ISO 8601 timestamp
 - **updated_at**: ISO 8601 timestamp
+- **memory_type**, **confidence**, **salience**, **scope**, **source_agent**: Optional agent memory metadata used for filtering and recall
 
 ## File Structure
 
@@ -183,6 +230,29 @@ result = store.create_memory(
 
 # Returns: {"id": "decisions/API Rate Limiting Strategy", ...}
 ```
+
+### Remember with precise metadata
+
+```python
+result = store.remember(
+    content="User prefers markdown-first durable memory with no mandatory vector database.",
+    id="preferences/Markdown First Memory",
+    meta={
+        "title": "Markdown First Memory",
+        "category": "preferences",
+        "memory_type": "preference",
+        "short_description": "Preference for markdown-first durable memory.",
+        "source_agent": "codex",
+        "confidence": "high",
+    },
+    mode="create",
+)
+```
+
+`remember` treats supplied `meta` as authoritative. If `short_description` is omitted,
+Smriti leaves it omitted instead of deriving a partial summary from the body. In `auto`
+mode, Smriti only appends to an existing memory when there is a strong deterministic
+match such as the same title; use `id` with `append` or `update` mode for explicit writes.
 
 ### Search memories
 

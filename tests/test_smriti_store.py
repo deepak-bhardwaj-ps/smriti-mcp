@@ -181,3 +181,209 @@ Agentic AI decisions depend on access, memory, and governance.
     assert results[0]["id"] == "Clippings/The biggest 𝗔𝗴𝗲𝗻𝘁𝗶𝗰 AI decision isn't model selection"
     assert indexed["indexed_notes"] == 1
     assert "[[The biggest 𝗔𝗴𝗲𝗻𝘁𝗶𝗰 AI decision isn't model selection]]" in loaded
+
+
+def test_human_memory_metadata_round_trips_and_filters(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+    created = store.create_memory(
+        {
+            "title": "No LLM Dependency",
+            "category": "preferences",
+            "memory_type": "preference",
+            "confidence": "high",
+            "source_agent": "codex",
+            "visibility": "shared",
+            "salience": 0.9,
+            "scope": {"project": "smriti-mcp"},
+        },
+        "The memory system should not depend on an LLM.",
+    )
+
+    results = store.search_memory(
+        "dependency",
+        filters={"memory_type": "preference", "scope": {"project": "smriti-mcp"}},
+        include_content=False,
+    )
+    markdown = store.get_memory(created["id"])
+
+    assert results[0]["id"] == created["id"]
+    assert "memory_type: preference" in markdown
+    assert "source_agent: codex" in markdown
+
+
+def test_record_trace_and_suggest_consolidation(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+    first = store.record_trace(
+        "User prefers shared memory across Codex and Claude.",
+        agent="codex",
+        scope={"project": "smriti-mcp"},
+        salience=0.8,
+    )
+    store.record_trace(
+        "Shared memory should preserve provenance.",
+        agent="codex",
+        scope={"project": "smriti-mcp"},
+    )
+
+    suggestions = store.suggest_consolidation(scope={"project": "smriti-mcp"}, agent="codex")
+
+    assert first["path"].startswith(".smriti/traces/")
+    assert suggestions["trace_count"] == 2
+    assert suggestions["groups"]
+
+
+def test_remember_creates_trace_and_appends_to_strong_match(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+    created = store.remember(
+        "User prefers Smriti to stay dependency-light and markdown-first.",
+        meta={
+            "title": "Memory System Preference",
+            "category": "preferences",
+            "short_description": "Preference for a light markdown-first memory system.",
+            "memory_type": "preference",
+            "source_agent": "codex",
+            "confidence": "high",
+        },
+    )
+    appended = store.remember(
+        "Memory System Preference: avoid mandatory vector databases.",
+        title="Memory System Preference",
+        category="preferences",
+        memory_type="preference",
+        source_agent="claude",
+    )
+    markdown = store.get_memory(created["id"])
+
+    assert created["action"] == "create"
+    assert appended["action"] == "append"
+    assert appended["id"] == created["id"]
+    assert "avoid mandatory vector databases" in markdown
+    assert "short_description: Preference for a light markdown-first memory system." in markdown
+
+
+def test_remember_honors_explicit_id_in_create_mode(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+
+    created = store.remember(
+        "Explicit IDs should be stable when agents provide them.",
+        id="project/Explicit Remember ID",
+        meta={
+            "title": "Remember ID Behavior",
+            "category": "project",
+            "short_description": "Remember honors explicit create IDs.",
+        },
+        mode="create",
+    )
+
+    assert created["action"] == "create"
+    assert created["id"] == "project/Explicit Remember ID"
+    assert "Remember honors explicit create IDs." in store.get_memory(created["id"])
+
+
+def test_remember_auto_mode_does_not_append_on_weak_metadata_match(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+    first = store.remember(
+        "Project Alpha uses deterministic markdown memory.",
+        meta={"title": "Project Alpha", "category": "project", "memory_type": "semantic"},
+    )
+    second = store.remember(
+        "Project Beta also mentions deterministic markdown memory.",
+        meta={"title": "Project Beta", "category": "project", "memory_type": "semantic"},
+    )
+
+    assert first["action"] == "create"
+    assert second["action"] == "create"
+    assert second["id"] != first["id"]
+
+
+def test_remember_explicit_append_requires_target_id(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+
+    with pytest.raises(ValueError):
+        store.remember("Append this somewhere.", mode="append")
+
+
+def test_recall_context_follows_links_and_marks_accessed(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+    target = store.create_memory(
+        {
+            "title": "Shared Memory Design",
+            "category": "project",
+            "memory_type": "semantic",
+            "salience": 0.7,
+        },
+        "Shared memory uses traces, provenance, and consolidation.",
+    )
+    store.create_memory(
+        {"title": "Agent Handoff", "category": "project", "memory_type": "episodic"},
+        "Continue from [[Shared Memory Design]] when implementing recall.",
+    )
+
+    recalled = store.recall_context("handoff recall", follow_links=True, mark_accessed=True)
+    target_markdown = store.get_memory(target["id"])
+
+    assert recalled["count"] >= 2
+    assert "Shared Memory Design" in recalled["context"]
+    assert "access_count: 1" in target_markdown
+
+
+def test_recall_context_can_include_exact_archived_body_match(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+    archived = store.create_memory(
+        {"title": "Archived Audit Note", "category": "audit", "status": "archived"},
+        "The exact archived phrase cobalt-lantern recall sentinel should be found.",
+    )
+    store.create_memory(
+        {"title": "Active Recall Note", "category": "audit", "salience": 1.0},
+        "This active note discusses recall generally.",
+    )
+
+    excluded = store.recall_context(
+        "cobalt-lantern recall sentinel",
+        include_archived=False,
+        mark_accessed=False,
+    )
+    included = store.recall_context(
+        "cobalt-lantern recall sentinel",
+        include_archived=True,
+        mark_accessed=False,
+    )
+
+    assert archived["id"] not in {memory["id"] for memory in excluded["memories"]}
+    assert included["memories"][0]["id"] == archived["id"]
+
+
+def test_consolidate_and_supersede_memory(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+    trace = store.record_trace("Old approach was replaced.", agent="codex")
+    old = store.create_memory({"title": "Old Approach", "category": "project"}, "Use the old approach.")
+    new = store.consolidate_memory(
+        "Use the new shared-memory approach.",
+        {
+            "title": "New Approach",
+            "category": "project",
+            "memory_type": "decision",
+            "source_agent": "codex",
+        },
+        trace_ids=[trace["id"]],
+    )
+
+    result = store.supersede_memory(old["id"], new["id"], reason="New design replaces the old one.")
+    old_markdown = store.get_memory(old["id"])
+    new_markdown = store.get_memory(new["id"])
+
+    assert result["status"] == "superseded"
+    assert "status: superseded" in old_markdown
+    assert f"superseded_by: {new['id']}" in old_markdown
+    assert old["id"] in new_markdown
+
+
+def test_review_memory_health_reports_unresolved_links_and_oversized_notes(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+    store.create_memory({"title": "Health Note", "category": "notes"}, "See [[Missing Note]].")
+    store.create_memory({"title": "Large Note", "category": "notes"}, "word " * 2501)
+
+    health = store.review_memory_health()
+
+    assert health["counts"]["unresolved_links"] == 1
+    assert health["counts"]["oversized"] == 1

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 import re
@@ -31,6 +33,16 @@ class MemoryMeta:
     tags: list[str] = field(default_factory=list)
     author: str | None = None
     status: str = "active"
+    memory_type: str | None = None
+    subtype: str | None = None
+    salience: float | None = None
+    confidence: str | None = None
+    source_agent: str | None = None
+    visibility: str | None = None
+    scope: dict[str, Any] = field(default_factory=dict)
+    related: list[str] = field(default_factory=list)
+    supersedes: list[str] = field(default_factory=list)
+    superseded_by: str | None = None
 
 
 def filename_segment(value: str) -> str:
@@ -78,6 +90,24 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _clamp_float(value: Any, minimum: float = 0.0, maximum: float = 1.0) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return max(minimum, min(maximum, float(value)))
+    except (TypeError, ValueError):
+        raise TypeError("Expected a numeric value.")
+
+
 class MemoryStore:
     def __init__(self, root: str | Path = DEFAULT_MEMORY_ROOT):
         self.root = Path(root).expanduser().resolve()
@@ -87,6 +117,10 @@ class MemoryStore:
     @property
     def index_path(self) -> Path:
         return self.root / "index.yaml"
+
+    @property
+    def trace_root(self) -> Path:
+        return self.root / ".smriti" / "traces"
 
     def create_memory(
         self,
@@ -178,10 +212,12 @@ class MemoryStore:
         for note_id, note in index["notes"].items():
             if not self._matches_filters(note, filters):
                 continue
+            doc = self._load(note_id)
             score = self._score_note(note_id, note, query_terms, index)
+            score += self._exact_content_match_score(doc.to_markdown(), query)
+            score += self._memory_affinity_score(note, filters or {})
             if score <= 0 and query_terms:
                 continue
-            doc = self._load(note_id)
             result = {
                 "id": note_id,
                 "title": note["title"],
@@ -189,6 +225,7 @@ class MemoryStore:
                 "score": round(score, 3),
                 "category": note.get("category"),
                 "tags": note.get("tags", []),
+                "memory_type": note.get("memory_type"),
                 "status": note.get("status", "active"),
                 "snippets": self._snippets(doc.to_markdown(), query_terms, note),
             }
@@ -197,6 +234,344 @@ class MemoryStore:
             results.append(result)
         results.sort(key=lambda item: item["score"], reverse=True)
         return results[: max(1, min(limit, 50))]
+
+    def record_trace(
+        self,
+        content: str,
+        type: str = "observed",
+        agent: str | None = None,
+        scope: dict[str, Any] | None = None,
+        memory_id: str | None = None,
+        salience: float | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        now = _now()
+        trace_id = hashlib.sha256(
+            f"{now}\n{agent or ''}\n{type}\n{content}".encode("utf-8")
+        ).hexdigest()[:16]
+        event = {
+            "id": trace_id,
+            "timestamp": now,
+            "type": str(type or "observed").strip() or "observed",
+            "agent": str(agent).strip() if agent else None,
+            "memory_id": memory_id,
+            "salience": _clamp_float(salience),
+            "scope": scope or {},
+            "content": content,
+            "metadata": metadata or {},
+        }
+        path = self.trace_root / now[:10] / f"{event['agent'] or 'shared'}.ndjson"
+        with self._lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+        return {"id": trace_id, "path": str(path.relative_to(self.root)), "event": event}
+
+    def remember(
+        self,
+        content: str,
+        meta: dict[str, Any] | None = None,
+        id: str | None = None,
+        title: str | None = None,
+        category: str = "memory",
+        memory_type: str | None = None,
+        tags: list[str] | None = None,
+        scope: dict[str, Any] | None = None,
+        source_agent: str | None = None,
+        confidence: str | None = None,
+        salience: float | None = None,
+        mode: str = "auto",
+    ) -> dict[str, Any]:
+        clean_meta = self._remember_meta_from_inputs(
+            content=content,
+            meta=meta,
+            title=title,
+            category=category,
+            memory_type=memory_type,
+            tags=tags,
+            scope=scope,
+            source_agent=source_agent,
+            confidence=confidence,
+            salience=salience,
+        )
+        query = str(clean_meta.get("title") or title or content)
+        filters: dict[str, Any] = {}
+        if clean_meta.get("memory_type"):
+            filters["memory_type"] = clean_meta["memory_type"]
+        if clean_meta.get("scope"):
+            filters["scope"] = clean_meta["scope"]
+        candidates = self.search_memory(query, limit=5, filters=filters or None, include_content=False)
+        best = candidates[0] if candidates else None
+        action = "create"
+        reason = "No sufficiently similar memory found."
+        if mode in {"append", "update"} and not id:
+            raise ValueError(f"{mode} mode requires a target memory id.")
+        if mode not in {"auto", "create", "append", "update"}:
+            raise ValueError("mode must be one of: auto, create, append, update.")
+        if mode in {"append", "update"}:
+            action = mode
+        elif mode == "create":
+            action = "create"
+        elif best and self._remember_should_append(best, clean_meta):
+            action = "append"
+            reason = "Existing memory had a strong title or metadata match."
+
+        target_id = id or (best["id"] if best else None)
+        if action == "append" and target_id:
+            result = self.append_memory(target_id, f"## Observation\n\n{content.rstrip()}\n")
+            memory_id = result["id"]
+        elif action == "update" and target_id:
+            result = self.update_memory(target_id, content=content)
+            memory_id = result["id"]
+        else:
+            result = self.create_memory(clean_meta, content, id=id)
+            memory_id = result["id"]
+
+        trace = self.record_trace(
+            content=content,
+            type="remembered",
+            agent=clean_meta.get("source_agent"),
+            scope=clean_meta.get("scope"),
+            memory_id=memory_id,
+            salience=clean_meta.get("salience"),
+            metadata={
+                "action": action,
+                "candidate_ids": [item["id"] for item in candidates],
+                "mode": mode,
+            },
+        )
+        return {
+            "action": action,
+            "id": memory_id,
+            "reason": reason,
+            "matched_candidates": candidates,
+            "trace_id": trace["id"],
+        }
+
+    def recall_context(
+        self,
+        query: str,
+        limit: int = 10,
+        filters: dict[str, Any] | None = None,
+        token_budget: int = 3000,
+        follow_links: bool = True,
+        include_archived: bool = False,
+        mark_accessed: bool = True,
+    ) -> dict[str, Any]:
+        effective_filters = dict(filters or {})
+        if not include_archived and "status" not in effective_filters:
+            effective_filters["exclude_statuses"] = ["archived", "superseded"]
+        if include_archived:
+            effective_filters["_include_archived"] = True
+
+        index = self._build_machine_index(include_content=False)
+        query_terms = normalise_terms(query)
+        scored: dict[str, float] = {}
+        for note_id, note in index["notes"].items():
+            if not self._matches_filters(note, effective_filters):
+                continue
+            doc = self._load(note_id)
+            score = self._score_note(note_id, note, query_terms, index)
+            score += self._exact_content_match_score(doc.to_markdown(), query)
+            score += self._memory_affinity_score(note, effective_filters)
+            if score <= 0 and query_terms:
+                continue
+            scored[note_id] = score
+
+        if follow_links:
+            for note_id, score in list(scored.items()):
+                neighbors = set(index.get("links", {}).get(note_id, []))
+                neighbors.update(index.get("backlinks", {}).get(note_id, []))
+                for neighbor in neighbors:
+                    note = index["notes"].get(neighbor)
+                    if not note or not self._matches_filters(note, effective_filters):
+                        continue
+                    scored[neighbor] = max(scored.get(neighbor, 0), score * 0.35)
+
+        ranked_ids = [
+            note_id
+            for note_id, _ in sorted(scored.items(), key=lambda item: item[1], reverse=True)
+        ][: max(1, min(limit, 50))]
+
+        sections: dict[str, list[str]] = {}
+        memories = []
+        budget_words = max(80, int(token_budget * 0.75))
+        used_words = 0
+        for note_id in ranked_ids:
+            doc = self._load(note_id)
+            note = index["notes"][note_id]
+            summary = self._recall_summary(note_id, note, doc, query_terms)
+            words = len(summary.split())
+            if used_words + words > budget_words and memories:
+                break
+            used_words += words
+            memory_type = str(note.get("memory_type") or "memory")
+            sections.setdefault(memory_type, []).append(summary)
+            memories.append(
+                {
+                    "id": note_id,
+                    "title": note.get("title"),
+                    "score": round(scored[note_id], 3),
+                    "memory_type": note.get("memory_type"),
+                    "status": note.get("status", "active"),
+                    "path": note.get("path"),
+                }
+            )
+            if mark_accessed:
+                self.mark_accessed(note_id)
+
+        markdown_lines = [f"# Recall Context: {query}", ""]
+        for section, entries in sections.items():
+            markdown_lines.extend([f"## {section}", ""])
+            markdown_lines.extend(entries)
+            markdown_lines.append("")
+
+        return {
+            "query": query,
+            "count": len(memories),
+            "memories": memories,
+            "context": "\n".join(markdown_lines).rstrip() + "\n",
+            "token_budget": token_budget,
+        }
+
+    def mark_accessed(self, id: str) -> dict[str, Any]:
+        with self._lock:
+            doc = self._load(id)
+            doc.meta["last_accessed_at"] = _now()
+            try:
+                doc.meta["access_count"] = int(doc.meta.get("access_count") or 0) + 1
+            except (TypeError, ValueError):
+                doc.meta["access_count"] = 1
+            salience = _clamp_float(doc.meta.get("salience"))
+            doc.meta["salience"] = min(1.0, (salience if salience is not None else 0.5) + 0.02)
+            self._atomic_save(doc)
+        return {"id": id, "status": "accessed", "access_count": doc.meta["access_count"]}
+
+    def suggest_consolidation(
+        self,
+        scope: dict[str, Any] | None = None,
+        since: str | None = None,
+        agent: str | None = None,
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        traces = self._load_traces(scope=scope, since=since, agent=agent)
+        groups: dict[str, dict[str, Any]] = {}
+        for trace in traces:
+            terms = normalise_terms(str(trace.get("content") or ""))
+            key = " ".join(terms[:3]) if terms else str(trace.get("type") or "trace")
+            group = groups.setdefault(
+                key,
+                {"topic": key, "traces": [], "related_memories": [], "recommendation": "review"},
+            )
+            group["traces"].append(trace)
+
+        for group in groups.values():
+            query = " ".join(normalise_terms(" ".join(str(t.get("content") or "") for t in group["traces"]))[:8])
+            if query:
+                group["related_memories"] = self.search_memory(query, limit=5, include_content=False)
+            if group["related_memories"]:
+                group["recommendation"] = "update_existing"
+            elif len(group["traces"]) > 1 or any((t.get("salience") or 0) >= 0.7 for t in group["traces"]):
+                group["recommendation"] = "create_memory"
+
+        ordered = sorted(
+            groups.values(),
+            key=lambda item: (len(item["traces"]), max((t.get("salience") or 0) for t in item["traces"])),
+            reverse=True,
+        )
+        return {"groups": ordered[: max(1, min(limit, 50))], "trace_count": len(traces)}
+
+    def consolidate_memory(
+        self,
+        content: str,
+        meta: dict[str, Any],
+        id: str | None = None,
+        trace_ids: list[str] | None = None,
+        mode: str = "create",
+    ) -> dict[str, Any]:
+        clean_meta = dict(meta)
+        if trace_ids:
+            clean_meta["sources"] = [f"trace:{trace_id}" for trace_id in trace_ids]
+        if mode == "append":
+            if not id:
+                raise ValueError("Append consolidation requires an existing memory id.")
+            result = self.append_memory(id, content)
+        elif mode == "update":
+            if not id:
+                raise ValueError("Update consolidation requires an existing memory id.")
+            result = self.update_memory(id, meta=clean_meta, content=content)
+        else:
+            result = self.create_memory(clean_meta, content, id=id)
+        self.record_trace(
+            content=f"Consolidated traces into {result['id']}.",
+            type="consolidated",
+            agent=clean_meta.get("source_agent"),
+            memory_id=result["id"],
+            metadata={"trace_ids": trace_ids or [], "mode": mode},
+        )
+        return result
+
+    def supersede_memory(self, old_id: str, new_id: str, reason: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            old_doc = self._load(old_id)
+            new_doc = self._load(new_id)
+            old_doc.meta["status"] = "superseded"
+            old_doc.meta["superseded_by"] = new_id
+            old_doc.meta["updated_at"] = _now()
+            supersedes = list(new_doc.meta.get("supersedes") or [])
+            if old_id not in supersedes:
+                supersedes.append(old_id)
+            new_doc.meta["supersedes"] = supersedes
+            new_doc.meta["updated_at"] = _now()
+            if reason:
+                old_doc.body = f"{old_doc.body.rstrip()}\n\n## Superseded\n\n{reason.strip()}\n"
+            self._atomic_save(old_doc)
+            self._atomic_save(new_doc)
+        return {"old_id": old_id, "new_id": new_id, "status": "superseded"}
+
+    def review_memory_health(self) -> dict[str, Any]:
+        index = self._build_machine_index(include_content=False)
+        notes = index["notes"]
+        duplicates = []
+        stale = []
+        oversized = []
+        unresolved_links = []
+        now = datetime.now(timezone.utc)
+        seen_titles: dict[str, str] = {}
+        for note_id, note in notes.items():
+            title_key = str(note.get("title") or "").strip().lower()
+            if title_key in seen_titles:
+                duplicates.append({"ids": [seen_titles[title_key], note_id], "reason": "same title"})
+            elif title_key:
+                seen_titles[title_key] = note_id
+
+            updated = _parse_datetime(note.get("updated_at"))
+            accessed = _parse_datetime(note.get("last_accessed_at"))
+            reference_time = accessed or updated
+            if reference_time and (now - reference_time).days >= 180 and note.get("status", "active") == "active":
+                stale.append({"id": note_id, "days_since_activity": (now - reference_time).days})
+
+            if int(note.get("word_count") or 0) > 2500:
+                oversized.append({"id": note_id, "word_count": note.get("word_count")})
+
+            for target in note.get("wikilinks") or []:
+                target_id = index["aliases"].get(str(target).lower(), target)
+                if target_id not in notes:
+                    unresolved_links.append({"id": note_id, "target": target})
+
+        return {
+            "duplicates": duplicates,
+            "stale": stale,
+            "oversized": oversized,
+            "unresolved_links": unresolved_links,
+            "counts": {
+                "notes": len(notes),
+                "duplicates": len(duplicates),
+                "stale": len(stale),
+                "oversized": len(oversized),
+                "unresolved_links": len(unresolved_links),
+            },
+        }
 
     def build_memory_index(self, group_by_category: bool = True) -> dict[str, Any]:
         entries = self.list_memories(limit=10000)
@@ -288,6 +663,8 @@ class MemoryStore:
         for file_path in sorted(self.root.rglob("*.md")):
             if file_path.name.startswith(".") or file_path.name == "index.md":
                 continue
+            if ".smriti" in file_path.relative_to(self.root).parts:
+                continue
             try:
                 doc = MemoryDocument.load(file_path)
             except Exception:
@@ -311,6 +688,22 @@ class MemoryStore:
             "category": doc.meta.get("category"),
             "author": doc.meta.get("author"),
             "status": doc.meta.get("status", "active"),
+            "memory_type": doc.meta.get("memory_type"),
+            "subtype": doc.meta.get("subtype"),
+            "salience": doc.meta.get("salience"),
+            "confidence": doc.meta.get("confidence"),
+            "source_agent": doc.meta.get("source_agent"),
+            "visibility": doc.meta.get("visibility"),
+            "scope": doc.meta.get("scope") or {},
+            "related": doc.meta.get("related") or [],
+            "supersedes": doc.meta.get("supersedes") or [],
+            "superseded_by": doc.meta.get("superseded_by"),
+            "sources": doc.meta.get("sources") or [],
+            "observed_at": doc.meta.get("observed_at"),
+            "last_verified_at": doc.meta.get("last_verified_at"),
+            "last_accessed_at": doc.meta.get("last_accessed_at"),
+            "access_count": doc.meta.get("access_count") or 0,
+            "expires_at": doc.meta.get("expires_at"),
             "created_at": doc.meta.get("created_at"),
             "updated_at": doc.meta.get("updated_at"),
             "word_count": len(doc.body.split()),
@@ -501,7 +894,42 @@ class MemoryStore:
             if freq:
                 score += math.log(freq + 1)
         backlinks = len(index.get("backlinks", {}).get(note_id, []))
-        return score + min(backlinks * 0.25, 5.0)
+        score += min(backlinks * 0.25, 5.0)
+        return score
+
+    def _memory_affinity_score(self, note: dict[str, Any], filters: dict[str, Any]) -> float:
+        score = 0.0
+        salience = _clamp_float(note.get("salience"))
+        if salience is not None:
+            score += salience * 2.0
+        try:
+            score += min(int(note.get("access_count") or 0) * 0.05, 2.0)
+        except (TypeError, ValueError):
+            pass
+        confidence = str(note.get("confidence") or "").lower()
+        score += {"high": 1.0, "medium": 0.5, "low": -0.5}.get(confidence, 0.0)
+        status = str(note.get("status") or "active").lower()
+        apply_status_penalty = not (filters.get("status") or filters.get("_include_archived"))
+        if apply_status_penalty:
+            if status == "archived":
+                score -= 3.0
+            elif status == "superseded":
+                score -= 5.0
+        expires_at = _parse_datetime(note.get("expires_at"))
+        if expires_at and expires_at < datetime.now(timezone.utc):
+            score -= 4.0
+        if filters.get("memory_type") and note.get("memory_type") == filters["memory_type"]:
+            score += 2.0
+        if filters.get("source_agent") and note.get("source_agent") == filters["source_agent"]:
+            score += 1.0
+        return score
+
+    def _exact_content_match_score(self, markdown: str, query: str) -> float:
+        collapsed_query = re.sub(r"\s+", " ", query).strip().lower()
+        if len(collapsed_query) < 8:
+            return 0.0
+        collapsed_markdown = re.sub(r"\s+", " ", markdown).lower()
+        return 20.0 if collapsed_query in collapsed_markdown else 0.0
 
     def _snippets(
         self,
@@ -534,7 +962,133 @@ class MemoryStore:
             return False
         if filters.get("tags") and not set(filters["tags"]).issubset(set(note.get("tags") or [])):
             return False
+        if filters.get("memory_type") and note.get("memory_type") != filters["memory_type"]:
+            return False
+        if filters.get("subtype") and note.get("subtype") != filters["subtype"]:
+            return False
+        if filters.get("source_agent") and note.get("source_agent") != filters["source_agent"]:
+            return False
+        if filters.get("visibility") and note.get("visibility") != filters["visibility"]:
+            return False
+        if filters.get("exclude_statuses") and note.get("status", "active") in filters["exclude_statuses"]:
+            return False
+        if filters.get("scope"):
+            note_scope = note.get("scope") or {}
+            for key, value in filters["scope"].items():
+                if note_scope.get(key) != value:
+                    return False
         return True
+
+    def _remember_meta_from_inputs(
+        self,
+        content: str,
+        meta: dict[str, Any] | None,
+        title: str | None,
+        category: str,
+        memory_type: str | None,
+        tags: list[str] | None,
+        scope: dict[str, Any] | None,
+        source_agent: str | None,
+        confidence: str | None,
+        salience: float | None,
+    ) -> dict[str, Any]:
+        clean_meta = dict(meta or {})
+        defaults = {
+            "title": title,
+            "category": category,
+            "tags": tags,
+            "memory_type": memory_type,
+            "scope": scope,
+            "source_agent": source_agent,
+            "confidence": confidence,
+            "salience": salience,
+        }
+        for key, value in defaults.items():
+            if key not in clean_meta or clean_meta[key] is None:
+                clean_meta[key] = value
+        if not clean_meta.get("title"):
+            clean_meta["title"] = self._title_from_content(content)
+        if not clean_meta.get("category"):
+            clean_meta["category"] = "memory"
+        if clean_meta.get("tags") is None:
+            clean_meta["tags"] = []
+        if clean_meta.get("scope") is None:
+            clean_meta["scope"] = {}
+        return self._clean_meta(clean_meta)
+
+    def _remember_should_append(self, candidate: dict[str, Any], meta: dict[str, Any]) -> bool:
+        if candidate.get("score", 0) < 6:
+            return False
+        candidate_title = str(candidate.get("title") or "").strip().lower()
+        title = str(meta.get("title") or "").strip().lower()
+        if title and title == candidate_title:
+            return True
+        return False
+
+    def _recall_summary(
+        self,
+        note_id: str,
+        note: dict[str, Any],
+        doc: MemoryDocument,
+        query_terms: list[str],
+    ) -> str:
+        title = note.get("title") or note_id
+        desc = note.get("short_description")
+        snippets = self._snippets(doc.body, query_terms, note)
+        lines = [f"- [[{title}]] (`{note_id}`)"]
+        if desc:
+            lines.append(f"  Summary: {desc}")
+        if note.get("confidence") or note.get("source_agent") or note.get("status"):
+            parts = [
+                f"status={note.get('status', 'active')}",
+                f"confidence={note.get('confidence')}" if note.get("confidence") else "",
+                f"source={note.get('source_agent')}" if note.get("source_agent") else "",
+            ]
+            lines.append("  " + ", ".join(part for part in parts if part))
+        for snippet in snippets[:2]:
+            lines.append(f"  {snippet}")
+        return "\n".join(lines)
+
+    def _load_traces(
+        self,
+        scope: dict[str, Any] | None = None,
+        since: str | None = None,
+        agent: str | None = None,
+    ) -> list[dict[str, Any]]:
+        since_dt = _parse_datetime(since) if since else None
+        traces = []
+        if not self.trace_root.exists():
+            return traces
+        for path in sorted(self.trace_root.rglob("*.ndjson")):
+            if agent and path.stem != agent:
+                continue
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                timestamp = _parse_datetime(event.get("timestamp"))
+                if since_dt and timestamp and timestamp < since_dt:
+                    continue
+                if scope:
+                    event_scope = event.get("scope") or {}
+                    if any(event_scope.get(key) != value for key, value in scope.items()):
+                        continue
+                traces.append(event)
+        return traces
+
+    def _title_from_content(self, content: str) -> str:
+        for line in content.splitlines():
+            stripped = line.strip(" #\t")
+            if stripped:
+                return stripped[:80]
+        return "Memory"
+
+    def _short_description_from_content(self, content: str) -> str:
+        collapsed = re.sub(r"\s+", " ", content).strip()
+        return collapsed[:160] if collapsed else "Durable memory."
 
     def _load(self, id: str) -> MemoryDocument:
         return MemoryDocument.load(self._path_for_id(id, must_exist=True))
@@ -594,9 +1148,25 @@ class MemoryStore:
             "category",
             "author",
             "status",
+            "memory_type",
+            "subtype",
+            "salience",
+            "confidence",
+            "source_agent",
+            "visibility",
+            "scope",
+            "related",
+            "supersedes",
+            "superseded_by",
+            "sources",
+            "observed_at",
+            "last_verified_at",
+            "last_accessed_at",
+            "access_count",
+            "expires_at",
         }
         clean = {key: value for key, value in meta.items() if key in allowed}
-        for list_key in ("aliases", "tags"):
+        for list_key in ("aliases", "tags", "related", "supersedes", "sources"):
             if list_key in clean:
                 value = clean[list_key]
                 if value is None:
@@ -605,9 +1175,37 @@ class MemoryStore:
                     raise TypeError(f"Memory metadata field {list_key} must be a list.")
                 else:
                     clean[list_key] = [str(item).strip() for item in value if str(item).strip()]
-        for str_key in ("title", "category", "author", "status", "short_description"):
+        for str_key in (
+            "title",
+            "category",
+            "author",
+            "status",
+            "short_description",
+            "memory_type",
+            "subtype",
+            "confidence",
+            "source_agent",
+            "visibility",
+            "superseded_by",
+            "observed_at",
+            "last_verified_at",
+            "last_accessed_at",
+            "expires_at",
+        ):
             if str_key in clean and clean[str_key] is not None:
                 clean[str_key] = str(clean[str_key]).strip()
+        if "scope" in clean:
+            if clean["scope"] is None:
+                clean["scope"] = {}
+            if not isinstance(clean["scope"], dict):
+                raise TypeError("Memory metadata field scope must be an object.")
+        if "salience" in clean:
+            clean["salience"] = _clamp_float(clean["salience"])
+        if "access_count" in clean and clean["access_count"] is not None:
+            try:
+                clean["access_count"] = max(0, int(clean["access_count"]))
+            except (TypeError, ValueError):
+                raise TypeError("Memory metadata field access_count must be an integer.")
         return clean
 
     def _atomic_save(self, doc: MemoryDocument) -> None:
