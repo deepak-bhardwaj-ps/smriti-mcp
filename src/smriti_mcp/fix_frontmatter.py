@@ -99,6 +99,14 @@ def extract_tags_from_frontmatter(meta: dict[str, Any]) -> list[str]:
     return []
 
 
+def normalise_list_field(value: Any) -> list[str]:
+    """Preserve scalar YAML values while repairing list-shaped metadata."""
+    if value is None:
+        return []
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    return [text for item in values if (text := str(item).strip())]
+
+
 def ensure_frontmatter(path: Path) -> tuple[bool, str]:
     """
     Check and fix frontmatter for a single file.
@@ -120,11 +128,17 @@ def ensure_frontmatter(path: Path) -> tuple[bool, str]:
         title = extract_title_from_content(body) or extract_title_from_filename(path)
         meta["title"] = title
         modified = True
+    elif not isinstance(meta["title"], str):
+        meta["title"] = str(meta["title"])
+        modified = True
     
     # Ensure category
     if "category" not in meta or not meta["category"]:
         category = infer_category_from_meta(original_meta, path)
         meta["category"] = category
+        modified = True
+    elif not isinstance(meta["category"], str):
+        meta["category"] = str(meta["category"])
         modified = True
     
     # Ensure status (default to active)
@@ -133,15 +147,15 @@ def ensure_frontmatter(path: Path) -> tuple[bool, str]:
         modified = True
     
     # Ensure aliases is a list
-    if "aliases" in meta and not isinstance(meta["aliases"], list):
-        meta["aliases"] = []
+    if "aliases" in meta and meta["aliases"] != normalise_list_field(meta["aliases"]):
+        meta["aliases"] = normalise_list_field(meta["aliases"])
         modified = True
     elif "aliases" not in meta:
         meta["aliases"] = []
     
     # Ensure tags is a list
-    if "tags" in meta and not isinstance(meta["tags"], list):
-        meta["tags"] = []
+    if "tags" in meta and meta["tags"] != normalise_list_field(meta["tags"]):
+        meta["tags"] = normalise_list_field(meta["tags"])
         modified = True
     elif "tags" not in meta:
         meta["tags"] = []

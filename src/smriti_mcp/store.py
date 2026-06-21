@@ -108,6 +108,28 @@ def _clamp_float(value: Any, minimum: float = 0.0, maximum: float = 1.0) -> floa
         raise TypeError("Expected a numeric value.")
 
 
+def _string_list(value: Any) -> list[str]:
+    """Normalise permissive YAML list fields read from existing notes."""
+    if value is None:
+        return []
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    return [text for item in values if (text := str(item).strip())]
+
+
+def _optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _non_negative_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 class MemoryStore:
     def __init__(self, root: str | Path = DEFAULT_MEMORY_ROOT):
         self.root = Path(root).expanduser().resolve()
@@ -197,7 +219,7 @@ class MemoryStore:
                 continue
             notes.append({"id": note_id, **note})
         notes.sort(key=lambda item: (item.get("category") or "", item.get("title") or ""))
-        return notes[: max(1, min(limit, 500))]
+        return notes[: max(1, min(limit, 10000))]
 
     def search_memory(
         self,
@@ -670,8 +692,8 @@ class MemoryStore:
             except Exception:
                 continue
             note_id = str(file_path.relative_to(self.root)).removesuffix(".md")
-            title = doc.meta.get("title")
-            if not isinstance(title, str) or not title.strip():
+            title = _optional_string(doc.meta.get("title"))
+            if not title:
                 continue
             notes[note_id] = self._summary_for_doc(note_id, file_path, doc)
         return notes
@@ -680,34 +702,41 @@ class MemoryStore:
         self, note_id: str, file_path: Path, doc: MemoryDocument
     ) -> dict[str, Any]:
         return {
-            "title": doc.meta.get("title"),
+            "title": str(doc.meta.get("title") or note_id),
             "path": str(file_path.relative_to(self.root)),
-            "short_description": doc.meta.get("short_description"),
-            "aliases": doc.meta.get("aliases") or [],
-            "tags": doc.meta.get("tags") or [],
-            "category": doc.meta.get("category"),
-            "author": doc.meta.get("author"),
-            "status": doc.meta.get("status", "active"),
-            "memory_type": doc.meta.get("memory_type"),
-            "subtype": doc.meta.get("subtype"),
-            "salience": doc.meta.get("salience"),
-            "confidence": doc.meta.get("confidence"),
-            "source_agent": doc.meta.get("source_agent"),
-            "visibility": doc.meta.get("visibility"),
-            "scope": doc.meta.get("scope") or {},
-            "related": doc.meta.get("related") or [],
-            "supersedes": doc.meta.get("supersedes") or [],
-            "superseded_by": doc.meta.get("superseded_by"),
-            "sources": doc.meta.get("sources") or [],
-            "observed_at": doc.meta.get("observed_at"),
-            "last_verified_at": doc.meta.get("last_verified_at"),
-            "last_accessed_at": doc.meta.get("last_accessed_at"),
-            "access_count": doc.meta.get("access_count") or 0,
-            "expires_at": doc.meta.get("expires_at"),
-            "created_at": doc.meta.get("created_at"),
-            "updated_at": doc.meta.get("updated_at"),
+            "short_description": _optional_string(doc.meta.get("short_description")),
+            "aliases": _string_list(doc.meta.get("aliases")),
+            "tags": _string_list(doc.meta.get("tags")),
+            "category": _optional_string(doc.meta.get("category")),
+            "author": _optional_string(doc.meta.get("author")),
+            "status": _optional_string(doc.meta.get("status")) or "active",
+            "memory_type": _optional_string(doc.meta.get("memory_type")),
+            "subtype": _optional_string(doc.meta.get("subtype")),
+            "salience": self._safe_salience(doc.meta.get("salience")),
+            "confidence": _optional_string(doc.meta.get("confidence")),
+            "source_agent": _optional_string(doc.meta.get("source_agent")),
+            "visibility": _optional_string(doc.meta.get("visibility")),
+            "scope": doc.meta.get("scope") if isinstance(doc.meta.get("scope"), dict) else {},
+            "related": _string_list(doc.meta.get("related")),
+            "supersedes": _string_list(doc.meta.get("supersedes")),
+            "superseded_by": _optional_string(doc.meta.get("superseded_by")),
+            "sources": _string_list(doc.meta.get("sources")),
+            "observed_at": _optional_string(doc.meta.get("observed_at")),
+            "last_verified_at": _optional_string(doc.meta.get("last_verified_at")),
+            "last_accessed_at": _optional_string(doc.meta.get("last_accessed_at")),
+            "access_count": _non_negative_int(doc.meta.get("access_count")),
+            "expires_at": _optional_string(doc.meta.get("expires_at")),
+            "created_at": _optional_string(doc.meta.get("created_at")),
+            "updated_at": _optional_string(doc.meta.get("updated_at")),
             "word_count": len(doc.body.split()),
         }
+
+    @staticmethod
+    def _safe_salience(value: Any) -> float | None:
+        try:
+            return _clamp_float(value)
+        except TypeError:
+            return None
 
     def _build_machine_index(self, include_content: bool) -> dict[str, Any]:
         index: dict[str, Any] = {
@@ -1227,7 +1256,7 @@ class MemoryStore:
 
     def _index_line(self, entry: dict[str, Any]) -> str:
         desc = f" - {entry['short_description']}" if entry.get("short_description") else ""
-        tags = f" **Tags:** {', '.join(entry['tags'])}" if entry.get("tags") else ""
+        tags = f" **Tags:** {', '.join(_string_list(entry.get('tags')))}" if entry.get("tags") else ""
         link = self._index_link(entry)
         return f"- {link}{desc}{tags}"
 

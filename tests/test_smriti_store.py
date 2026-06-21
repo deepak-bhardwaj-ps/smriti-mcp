@@ -75,6 +75,67 @@ def test_build_and_load_memory_index(tmp_path: Path) -> None:
     assert "[[Alpha]] - first" in store.load_memory_index()
 
 
+def test_index_normalises_malformed_external_frontmatter_types(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+    note = tmp_path / "notes" / "Loose Metadata.md"
+    note.parent.mkdir()
+    note.write_text(
+        """---
+title: 99
+category: 42
+tags: [memory, 7]
+aliases: alternate
+scope: invalid
+salience: invalid
+access_count: invalid
+created_at: 2026-06-21
+---
+
+Body.
+""",
+        encoding="utf-8",
+    )
+
+    result = store.build_memory_index()
+    index = store._build_machine_index(include_content=False)
+    summary = index["notes"]["notes/Loose Metadata"]
+
+    assert result["indexed_notes"] == 1
+    assert summary["title"] == "99"
+    assert "**Tags:** memory, 7" in store.load_memory_index()
+    assert summary["aliases"] == ["alternate"]
+    assert summary["category"] == "42"
+    assert summary["scope"] == {}
+    assert summary["salience"] is None
+    assert summary["access_count"] == 0
+    assert summary["created_at"] == "2026-06-21"
+
+
+def test_rebuild_preserves_scalar_tags_and_aliases(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+    note = tmp_path / "notes" / "Scalar Metadata.md"
+    note.parent.mkdir()
+    note.write_text(
+        """---
+title: Scalar Metadata
+category: notes
+tags: [durable, 7]
+aliases: 123
+---
+
+Body.
+""",
+        encoding="utf-8",
+    )
+
+    store.rebuild_memory(apply_wikilinks=False)
+    markdown = note.read_text(encoding="utf-8")
+
+    assert "tags:\n- durable" in markdown
+    assert "- '7'" in markdown
+    assert "aliases:\n- '123'" in markdown
+
+
 def test_wikilinks_resolve_to_title_preserving_filenames(tmp_path: Path) -> None:
     store = MemoryStore(tmp_path)
     target = store.create_memory(
