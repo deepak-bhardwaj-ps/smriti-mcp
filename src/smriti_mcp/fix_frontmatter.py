@@ -145,6 +145,31 @@ def ensure_frontmatter(path: Path) -> tuple[bool, str]:
     if "status" not in meta:
         meta["status"] = "active"
         modified = True
+
+    # OKF compatibility fields
+    if "type" not in meta or not meta["type"]:
+        meta["type"] = meta["category"]
+        modified = True
+    if "description" not in meta or not meta["description"]:
+        if "short_description" in meta and meta["short_description"]:
+            meta["description"] = meta["short_description"]
+            modified = True
+        elif body.strip():
+            first_line = body.strip().splitlines()[0].strip()
+            meta["description"] = first_line[:160]
+            modified = True
+        else:
+            meta["description"] = None
+    if "short_description" not in meta or not meta["short_description"]:
+        meta["short_description"] = meta.get("description")
+        if meta["short_description"] is not None:
+            modified = True
+    if "resource" not in meta:
+        meta["resource"] = None
+    if "timestamp" not in meta or not meta["timestamp"]:
+        meta["timestamp"] = meta.get("updated_at") or meta.get("created_at")
+        if meta["timestamp"] is not None:
+            modified = True
     
     # Ensure aliases is a list
     if "aliases" in meta and meta["aliases"] != normalise_list_field(meta["aliases"]):
@@ -159,10 +184,6 @@ def ensure_frontmatter(path: Path) -> tuple[bool, str]:
         modified = True
     elif "tags" not in meta:
         meta["tags"] = []
-    
-    # Preserve short_description if exists, otherwise optional
-    if "short_description" not in meta:
-        meta["short_description"] = None
     
     if modified:
         try:
@@ -191,10 +212,10 @@ def scan_vault(vault_path: Path, dry_run: bool = False) -> dict[str, Any]:
     if not vault_path.exists():
         return {"error": f"Vault path not found: {vault_path}"}
     
-    # Find all .md files except index.md
+    # Find all .md files except reserved files
     md_files = [
         f for f in vault_path.rglob("*.md") 
-        if f.name != "index.md" and f.name != ".obsidian"
+        if f.name not in {"index.md", "log.md"} and f.name != ".obsidian"
     ]
     
     # Filter out hidden directories

@@ -21,6 +21,9 @@ def test_create_memory_uses_title_filename_and_markdown_frontmatter(tmp_path: Pa
     assert (tmp_path / "Project Notes" / "Agent Runtime Decision.md").exists()
     markdown = store.get_memory(result["id"])
     assert "title: Agent Runtime Decision" in markdown
+    assert "type: Project Notes" in markdown
+    assert "description: Use durable memory for decisions." in markdown
+    assert "timestamp:" in markdown
     assert "Use durable memory for decisions." in markdown
 
 
@@ -216,7 +219,22 @@ def test_rebuild_memory_fixes_frontmatter_applies_wikilinks_and_indexes(tmp_path
     assert result["wikilinks"]["links_added"] == 1
     assert result["index"]["indexed_notes"] == 2
     assert "title: Needs Frontmatter" in markdown
+    assert "type: notes" in markdown
     assert "[[Content Intelligence]] here" in markdown
+
+
+def test_log_md_is_reserved(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path)
+    log_file = tmp_path / "log.md"
+    log_file.write_text(
+        "# Directory Update Log\n\n## 2026-06-24\n* **Update**: Entry.\n",
+        encoding="utf-8",
+    )
+
+    result = store.rebuild_memory(apply_wikilinks=False, fix_frontmatter=False)
+
+    assert result["index"]["indexed_notes"] == 0
+    assert log_file.read_text(encoding="utf-8").startswith("# Directory Update Log")
 
 
 def test_search_and_index_preserve_existing_obsidian_paths(tmp_path: Path) -> None:

@@ -22,6 +22,7 @@ WIKILINK_FULL_RE = re.compile(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
 CODE_SPAN_RE = re.compile(r"```.*?```|`[^`\n]+`", re.DOTALL)
 MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]+\]\([^)]+\)")
 DEFAULT_MEMORY_ROOT = Path.home() / ".smriti" / "memory"
+OKF_RESERVED_FILENAMES = {"index.md", "log.md"}
 
 
 @dataclass
@@ -150,7 +151,16 @@ class MemoryStore:
         content: str,
         id: str | None = None,
     ) -> dict[str, Any]:
-        clean_meta = self._clean_meta(meta)
+        meta = dict(meta)
+        if not meta.get("description") and not meta.get("short_description"):
+            summary = self._short_description_from_content(content)
+            meta["description"] = summary
+            meta["short_description"] = summary
+        elif meta.get("description") and not meta.get("short_description"):
+            meta["short_description"] = meta["description"]
+        elif meta.get("short_description") and not meta.get("description"):
+            meta["description"] = meta["short_description"]
+        clean_meta = self._okf_meta_for_write(self._clean_meta(meta))
         memory_id = self._clean_id(id) if id else self._default_id(clean_meta)
         path = self._path_for_id(memory_id, must_exist=False)
         with self._lock:
@@ -163,6 +173,7 @@ class MemoryStore:
                 "updated_at": now,
                 **clean_meta,
             }
+            full_meta["timestamp"] = full_meta.get("timestamp") or now
             self._atomic_save(MemoryDocument(meta=full_meta, body=content, path=path))
         return {"id": memory_id, "path": str(path)}
 
@@ -174,6 +185,8 @@ class MemoryStore:
             doc = self._load(id)
             doc.body = f"{doc.body.rstrip()}\n\n{content.lstrip()}".rstrip() + "\n"
             doc.meta["updated_at"] = _now()
+            doc.meta["timestamp"] = doc.meta["updated_at"]
+            doc.meta = self._okf_meta_for_write(doc.meta)
             self._atomic_save(doc)
         return {"id": id, "status": "updated"}
 
@@ -186,10 +199,12 @@ class MemoryStore:
         with self._lock:
             doc = self._load(id)
             if meta:
-                doc.meta.update(self._clean_partial_meta(meta))
+                doc.meta.update(self._okf_meta_for_write(self._clean_partial_meta(meta)))
             if content is not None:
                 doc.body = content
+            doc.meta = self._okf_meta_for_write(doc.meta)
             doc.meta["updated_at"] = _now()
+            doc.meta["timestamp"] = doc.meta["updated_at"]
             self._atomic_save(doc)
         return {"id": id, "status": "updated"}
 
@@ -683,7 +698,7 @@ class MemoryStore:
     def _scan_notes(self) -> dict[str, dict[str, Any]]:
         notes = {}
         for file_path in sorted(self.root.rglob("*.md")):
-            if file_path.name.startswith(".") or file_path.name == "index.md":
+            if file_path.name.startswith(".") or file_path.name in OKF_RESERVED_FILENAMES:
                 continue
             if ".smriti" in file_path.relative_to(self.root).parts:
                 continue
@@ -701,13 +716,22 @@ class MemoryStore:
     def _summary_for_doc(
         self, note_id: str, file_path: Path, doc: MemoryDocument
     ) -> dict[str, Any]:
+        description = _optional_string(doc.meta.get("description")) or _optional_string(
+            doc.meta.get("short_description")
+        )
+        timestamp = _optional_string(doc.meta.get("timestamp")) or _optional_string(
+            doc.meta.get("updated_at")
+        )
         return {
             "title": str(doc.meta.get("title") or note_id),
             "path": str(file_path.relative_to(self.root)),
-            "short_description": _optional_string(doc.meta.get("short_description")),
+            "short_description": description,
+            "description": description,
             "aliases": _string_list(doc.meta.get("aliases")),
             "tags": _string_list(doc.meta.get("tags")),
             "category": _optional_string(doc.meta.get("category")),
+            "type": _optional_string(doc.meta.get("type")) or _optional_string(doc.meta.get("category")),
+            "resource": _optional_string(doc.meta.get("resource")),
             "author": _optional_string(doc.meta.get("author")),
             "status": _optional_string(doc.meta.get("status")) or "active",
             "memory_type": _optional_string(doc.meta.get("memory_type")),
@@ -726,6 +750,7 @@ class MemoryStore:
             "last_accessed_at": _optional_string(doc.meta.get("last_accessed_at")),
             "access_count": _non_negative_int(doc.meta.get("access_count")),
             "expires_at": _optional_string(doc.meta.get("expires_at")),
+            "timestamp": timestamp,
             "created_at": _optional_string(doc.meta.get("created_at")),
             "updated_at": _optional_string(doc.meta.get("updated_at")),
             "word_count": len(doc.body.split()),
@@ -755,6 +780,9 @@ class MemoryStore:
             path = self._path_for_id(note_id, must_exist=True)
             note = self._summary_for_doc(note_id, path, doc)
             note["wikilinks"] = extract_wikilinks(doc.body)
+            note["links"] = [
+                link for link in self._markdown_links(doc.body) if not link.startswith("#")
+            ]
             if include_content:
                 note["content"] = doc.body
             index["aliases"][str(note["title"]).lower()] = note_id
@@ -772,6 +800,14 @@ class MemoryStore:
                 index["terms"].setdefault(term, {}).setdefault(note_id, 0)
                 index["terms"][term][note_id] += 1
         return index
+
+    def _markdown_links(self, body: str) -> list[str]:
+        links: list[str] = []
+        for match in re.finditer(r"(!?)\[[^\]]+\]\(([^)]+)\)", body):
+            target = match.group(2).strip()
+            if target:
+                links.append(target)
+        return links
 
     def _wikilink_candidates_by_note(self) -> dict[str, list[dict[str, str]]]:
         phrase_targets: dict[str, dict[str, str] | None] = {}
@@ -1170,7 +1206,10 @@ class MemoryStore:
 
     def _clean_partial_meta(self, meta: dict[str, Any]) -> dict[str, Any]:
         allowed = {
+            "type",
             "title",
+            "description",
+            "resource",
             "short_description",
             "aliases",
             "tags",
@@ -1193,6 +1232,7 @@ class MemoryStore:
             "last_accessed_at",
             "access_count",
             "expires_at",
+            "timestamp",
         }
         clean = {key: value for key, value in meta.items() if key in allowed}
         for list_key in ("aliases", "tags", "related", "supersedes", "sources"):
@@ -1205,7 +1245,10 @@ class MemoryStore:
                 else:
                     clean[list_key] = [str(item).strip() for item in value if str(item).strip()]
         for str_key in (
+            "type",
             "title",
+            "description",
+            "resource",
             "category",
             "author",
             "status",
@@ -1220,6 +1263,7 @@ class MemoryStore:
             "last_verified_at",
             "last_accessed_at",
             "expires_at",
+            "timestamp",
         ):
             if str_key in clean and clean[str_key] is not None:
                 clean[str_key] = str(clean[str_key]).strip()
@@ -1235,6 +1279,18 @@ class MemoryStore:
                 clean["access_count"] = max(0, int(clean["access_count"]))
             except (TypeError, ValueError):
                 raise TypeError("Memory metadata field access_count must be an integer.")
+        return clean
+
+    def _okf_meta_for_write(self, meta: dict[str, Any]) -> dict[str, Any]:
+        clean = dict(meta)
+        if not clean.get("type") and clean.get("category"):
+            clean["type"] = clean["category"]
+        if clean.get("description") is None and clean.get("short_description") is not None:
+            clean["description"] = clean["short_description"]
+        if clean.get("short_description") is None and clean.get("description") is not None:
+            clean["short_description"] = clean["description"]
+        if clean.get("timestamp") is None:
+            clean["timestamp"] = clean.get("updated_at") or clean.get("created_at")
         return clean
 
     def _atomic_save(self, doc: MemoryDocument) -> None:
